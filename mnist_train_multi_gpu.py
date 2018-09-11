@@ -6,12 +6,14 @@ from datetime import datetime
 import os.path
 import re
 import time
+import numpy as np
 
 import tensorflow as tf
 import mnist_input
 import mnist_model
 
 FILE_NAMES = './mnist-train-tfrecord'
+NUM_GPU = 2
 
 # calculate the local loss for current batch on current device
 # this method should be called in context of each device
@@ -51,72 +53,118 @@ def average_gradients(tower_grads):
 			# we only need the grad info (g)
 			# Add 0 dimension to the gradients to represent the tower.
 			# tf.expand_dims: insert a dimension with length 1 to a given axis
+			# the expanded_g looks like: extended_g = [g]
 			expanded_g = tf.expand_dims(g, 0)
-			# Append on a 'tower' dimension which we will average over below.
-      			grads.append(expanded_g)
+			# successively append gradient info to the container 'grads'
+			# the grads looks like: grads = [[g0], [g1], [g2], ...]
+      		grads.append(expanded_g)
 
 		# Average over the 'tower' dimension.
-		# tf.concat: concatinate input in a given axis
+		# tf.concat: concatinate input in a given axis (here is the 0-th axis)
+		# the grad looks like: grad = [g0, g1, g2, ...]
 		grad = tf.concat(axis=0, values=grads)
 		# tf.reduce_mean: compute the average along given axis
+		# so the grad will be averaged to: grad = mean(g0,g1,g2,...)
 		grad = tf.reduce_mean(grad, 0)
-# 2018/09/07
-    # Keep in mind that the Variables are redundant because they are shared
-    # across towers. So .. we will just return the first tower's pointer to
-    # the Variable.
-    v = grad_and_vars[0][1]
-    grad_and_var = (grad, v)
-    average_grads.append(grad_and_var)
-  return average_grads
+
+	# Keep in mind that the Variables are redundant because they are shared
+	# across towers. So .. we will just return the first tower's pointer to
+	# the Variable.
+	# i.e. var0_gpu0 = var0_gpu1 = var0_gpu2 = ...
+	v = grad_and_vars[0][1]
+	grad_and_var = (grad, v)
+	average_grads.append(grad_and_var)
+	return average_grads
 
 def train():
 	"""Train MNIST for a number of steps."""
   	# create a new graph and use it as default graph in the following context:
-	with tf.Graph().as_default():
-		global_step = tf.train.get_or_create_global_step()
+	# this context will also be created on host side
+	with tf.Graph().as_default(), tf.device('/cpu:0'):
+		#global_step = tf.train.get_or_create_global_step()	# why not use this?
+		global_step = tf.get_variable('global_step', [], initializer=tf.constant_initializer(0), trainable=False)
 
-		# Get images and labels
-		# Force input pipeline to CPU:0 to avoid operations sometimes ending up on
-		# GPU and resulting in a slow down.
-		with tf.device('/cpu:0'):
-			labels, images = mnist_input.inputs([FILE_NAMES], batchSize=100, shuffle=True)
+		# Create an optimizer that performs gradient descent.
+		opt = tf.train.GradientDescentOptimizer(0.001)
+
+		# create data batch on host side
+		labels, images = mnist_input.inputs([FILE_NAMES], batchSize=100, shuffle=True)
+		batch_queue = tf.contrib.slim.prefetch_queue.prefetch_queue([labels, images], capacity=2 * NUM_GPU)
+
+		# compute gradients on each device
+		tower_grads = []
+
+		with tf.variable_scope(tf.get_variable_scope()):
+			for i in xrange(NUM_GPU):
+				with tf.device('/gpu:%d' % i):
+					with tf.name_scope('%s_%d' % ('tower', i)) as scope:
+						# Dequeues one batch for the GPU
+						label_batch, image_batch = batch_queue.dequeue()
+						# compute local loss for the batch
+						loss = tower_loss(scope, image_batch, label_batch)
+						# share the variables of model from gpu:0
+						tf.get_variable_scope().reuse_variables()
+						# Retain the summaries from the final tower.
+						summaries = tf.get_collection(tf.GraphKeys.SUMMARIES, scope)
+						# Calculate the gradients for the batch of data on this device.
+						grads = opt.compute_gradients(loss)
+						# push local gradients into the global container 'tower_grads'
+						tower_grads.append(grads)
 	
-		# Build a Graph that computes the logits predictions from the
-		# inference model.
-		logits = mnist_model.inference(images)
-	
-		# Calculate loss.
-		loss = mnist_model.loss(logits, labels)
-	
-		# Build a Graph that trains the model with one batch of examples and
-		# updates the model parameters.
-		train_op = mnist_model.train(loss, 0.001, global_step)
-	
-		class _LoggerHook(tf.train.SessionRunHook):
-		"""Logs loss and runtime."""
-			def begin(self):
-				self._step = -1
-				self._start_time = time.time()
+		# We must calculate the mean of each gradient. Note that this is the
+		# synchronization point across all towers.
+		grads = average_gradients(tower_grads)
 		
-			def before_run(self, run_context):
-				self._step += 1
-				return tf.train.SessionRunArgs(loss)  # Asks for loss value.
+		# Add histograms for gradients.
+		for grad, var in grads:
+			if grad is not None:
+				summaries.append(tf.summary.histogram(var.op.name + '/gradients', grad))
 		
-			def after_run(self, run_context, run_values):
-				if self._step % 100 == 0:
-					current_time = time.time()
-					duration = current_time - self._start_time
-					self._start_time = current_time
+		# Apply the gradients to adjust the shared variables.
+		apply_gradient_op = opt.apply_gradients(grads, global_step=global_step)
+
+		# Add histograms for trainable variables.
+		for var in tf.trainable_variables():
+			summaries.append(tf.summary.histogram(var.op.name, var))
 		
-					loss_value = run_values.results
-					sec_per_batch = float(duration / 100)
-		
-					format_str = ('%s: step %d, loss = %.2f (%.3f sec/batch)')
-					print (format_str % (datetime.now(), self._step, loss_value, sec_per_batch))
-	
-		with tf.train.MonitoredTrainingSession(hooks=[_LoggerHook()]) as mon_sess:
-			while not mon_sess.should_stop():
-				mon_sess.run(train_op)
+		# Track the moving averages of all trainable variables.
+		variable_averages = tf.train.ExponentialMovingAverage(0.9, global_step)
+		variables_averages_op = variable_averages.apply(tf.trainable_variables())
+
+		# Group all updates to into a single train op.
+		train_op = tf.group(apply_gradient_op, variables_averages_op)
+
+		# Create a saver to save all variables
+		saver = tf.train.Saver(tf.global_variables())
+
+		# Build the summary operation from the last tower summaries.
+		summary_op = tf.summary.merge(summaries)
+
+		# Build an initialization operation to run below.
+		init = tf.global_variables_initializer()
+
+		# Start running operations on the Graph. allow_soft_placement must be set to
+		# True to build towers on GPU, as some of the ops do not have GPU
+		# implementations.
+		sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=True))
+		sess.run(init)
+
+		# Start the queue runners.
+		tf.train.start_queue_runners(sess=sess)
+
+		for step in xrange(50000):
+			start_time = time.time()
+			_, loss_value = sess.run([train_op, loss])
+			duration = time.time() - start_time
+
+			assert not np.isnan(loss_value), 'Model diverged with loss = NaN'
+
+			if step % 10 == 0:
+				num_examples_per_step = 100/2
+				examples_per_sec = num_examples_per_step / duration
+				sec_per_batch = duration / 2
+				format_str = ('%s: step %d, loss = %.2f (%.1f examples/sec; %.3f sec/batch)')
+				print (format_str % (datetime.now(), step, loss_value, examples_per_sec, sec_per_batch))
 
 
 def main(argv=None):  # pylint: disable=unused-argument
