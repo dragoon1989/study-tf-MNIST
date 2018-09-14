@@ -34,7 +34,7 @@ def tower_loss(scope, images, labels):
 	total_loss = tf.add_n(losses, name='total_loss')
 	# add summaries
 	for l in losses + [total_loss]:
-		loss_name = re.sub('%s_[0-9]*/' % mnist_model.TOWER_NAME, '', l.op.name)
+		loss_name = re.sub('%s_[0-9]*/' % 'tower', '', l.op.name)
 		tf.summary.scalar(loss_name, l)
 	
 	# over, return the total loss for current batch
@@ -147,11 +147,12 @@ def train():
 		# True to build towers on GPU, as some of the ops do not have GPU
 		# implementations.
 		sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=True))
+		# First of all, initialize the model variables
 		sess.run(init)
 
-		# Start the queue runners.
+		# Then, start the queue runners.
 		tf.train.start_queue_runners(sess=sess)
-
+		# run the model N times
 		for step in xrange(50000):
 			start_time = time.time()
 			_, loss_value = sess.run([train_op, loss])
